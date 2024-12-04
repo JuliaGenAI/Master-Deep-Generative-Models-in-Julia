@@ -15,6 +15,7 @@ which demonstrates how to reach the state-of-the-art performance in Julia[^2].
 - GPT2
 - LLAMA
 - DDPM
+- MoE
 - [ ] VQGAN
 - [ ] CLIP
 - [ ] MaskGIT
