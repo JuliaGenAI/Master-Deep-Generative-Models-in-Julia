@@ -197,6 +197,133 @@ struct VisionModel
     projector::MultiModalProjector
 end
 
+(m::VisionModel)(x) = m.projector(m.encoder(x))
+
+#####
+
+struct EmbeddingLayer
+    weight::AbstractMatrix
+end
+
+(m::EmbeddingLayer)(ids) = @view(m.weight[:, ids]) .* sqrt(size(m.weight, 1))
+
+struct RopeCache
+    rope_theta::Float32
+    head_dim::Int
+    cos
+    sin
+
+    function RopeCache(; rope_theta, head_dim, max_position_embeddings, factor=nothing)
+        inv_freq = 1 ./ (rope_theta .^ ((0:2:(head_dim-1)) ./ head_dim))
+        t = 0:(max_position_embeddings-1)
+        freqs = inv_freq * t'
+        if !isnothing(factor)
+            freqs ./= factor
+        end
+        new(rope_theta, head_dim, cos.(freqs), sin.(freqs))
+    end
+end
+
+function apply_rotary_embedding(x, cache)
+    D, H, T, B = size(x)
+    freqs_cos = reshape(cache.cos[:, 1:T], :, 1, T)
+    freqs_sin = reshape(cache.sin[:, 1:T], :, 1, T)
+
+    x_r = selectdim(reshape(x, 2, :, size(x)[2:end]...), 1, 1)
+    x_i = selectdim(reshape(x, 2, :, size(x)[2:end]...), 1, 2)
+
+    x_pos_r = freqs_cos .* x_r .- freqs_sin .* x_i
+    x_pos_i = freqs_sin .* x_r .+ freqs_cos .* x_i
+    vcat(x_pos_r, x_pos_i)
+end
+
+struct Gemma3Attention
+    head_dim::Int
+    num_attention_heads::Int
+    num_key_value_heads::Int
+    query_pre_attn_scalar::Int
+
+    q_proj::Dense
+    k_proj::Dense
+    v_proj::Dense
+    o_proj::Dense
+
+    q_norm::RMSNorm
+    k_norm::RMSNorm
+
+    rope_cache::RopeCache
+end
+
+function (m::Gemma3Attention)(x, mask)
+    q, k, v = m.q_proj(x), m.k_proj(x), m.v_proj(x)
+    q = reshape(q, m.head_dim, m.num_attention_heads, size(q, 2), size(q, 3))
+    k = reshape(k, m.head_dim, m.num_key_value_heads, size(k, 2), size(k, 3))
+    v = reshape(v, m.head_dim, m.num_key_value_heads, size(v, 2), size(v, 3))
+
+    q = m.q_norm(q)
+    k = m.k_norm(k)
+
+    q = apply_rotary_embedding(q, m.rope_cache)
+    k = apply_rotary_embedding(k, m.rope_cache)
+    k, v = repeat.((k, v), inner=(1, m.num_attention_heads ÷ m.num_key_value_heads, 1, 1)) # GQA
+
+    q = permutedims(q, (1, 3, 2, 4))
+    kᵗ = permutedims(k, (3, 1, 2, 4))
+    v = permutedims(v, (1, 3, 2, 4))
+
+    scale = m.query_pre_attn_scalar^(-0.5)
+    logits = batched_mul(kᵗ, q .* scale)
+    masked_logits = ifelse.(mask, logits, typemin(eltype(logits)))
+    scores = softmax(masked_logits)
+    out = batched_mul(v, scores)
+    out = permutedims(out, (1, 3, 2, 4))
+    out = reshape(out, :, size(out, 3), size(out, 4))
+    o = m.o_proj(out)
+end
+
+struct FeedForwardLayer
+    up_proj::Dense
+    gate_proj::Dense
+    down_proj::Dense
+end
+
+function (m::FeedForwardLayer)(x)
+    h = m.up_proj(x)
+    a = m.gate_proj(x)
+    h = gelu_tanh.(a .* h)
+    o = m.down_proj(h)
+end
+
+struct TransformerBlock
+    pre_attn_norm::RMSNorm
+    self_attn::Gemma3Attention
+    post_attn_norm::RMSNorm
+    pre_ffn_norm::RMSNorm
+    ffn::FeedForwardLayer
+    post_ffn_norm::RMSNorm
+end
+
+function (m::TransformerBlock)(x, mask)
+    h = x |> m.pre_attn_norm |> Base.Fix2(m.self_attn, mask) |> m.post_attn_norm
+    o = (x + h) |> m.pre_ffn_norm |> m.ffn |> m.post_ffn_norm
+    x + h + o
+end
+
+struct Transformer
+    embedding::EmbeddingLayer
+    blocks::Vector{TransformerBlock}
+    norm::RMSNorm
+    head::Dense
+end
+
+function (m::Transformer)(x, causal_mask, sliding_window_causal_mask, sliding_window_pattern)
+    h = m.embedding(x)
+    for (i, block) in enumerate(m.blocks)
+        h = block(h, sliding_window_pattern % i == 0 ? mask : sliding_window_causal_mask)
+    end
+    h = m.norm(h)
+    m.dense(h)
+end
 
 #####
 
