@@ -3,7 +3,7 @@ using ImageCore: channelview
 using SafeTensors: load_sharded_safetensors
 
 import HuggingFaceTokenizers as HFT
-using NNlib: batched_mul, gelu_tanh, conv, DenseConvDims, softmax
+using NNlib: batched_mul, gelu_tanh, conv, DenseConvDims, softmax, meanpool, PoolDims
 using Statistics: mean, var
 
 #####
@@ -154,6 +154,51 @@ function (m::SiglipEncoder)(x)
 end
 
 #####
+# MultiModalProjector
+#####
+
+struct MeanPool
+    k
+end
+
+(m::MeanPool)(x) = meanpool(x, PoolDims(x, m.k; stride=m.k))
+
+struct RMSNorm
+    eps::Float32
+    weight::AbstractVector
+end
+
+function (m::RMSNorm)(x::AbstractArray{T}) where {T}
+    (1 .+ m.weight) .* T.(Float32.(x) ./ sqrt.(mean(Float32.(x) .^ 2, dims=1) .+ m.eps))
+end
+
+struct MultiModalProjector
+    patches_per_image::Int
+
+    pooling::MeanPool
+    rms_norm::RMSNorm
+    vision2text::Dense{Nothing}
+end
+
+function (m::MultiModalProjector)(x)
+    P, D, B = size(x)
+    x = reshape(x, m.patches_per_image, m.patches_per_image, D, B)
+    x = m.pooling(x)
+    x = reshape(x, :, D, B)
+    x = permutedims(x, (2, 1, 3))
+    x = m.rms_norm(x)
+    m.vision2text(x)
+end
+
+#####
+
+struct VisionModel
+    encoder::SiglipEncoder
+    projector::MultiModalProjector
+end
+
+
+#####
 
 using JSON3
 
@@ -178,64 +223,74 @@ function from_pretrained(MODEL=joinpath(@__DIR__, "..", "models", "google", "gem
 
     vc = c["vision_config"]
 
-    m = SiglipEncoder(
-        SiglipVisionEmbedding(
-            CrossCor(
-                permutedims(ps["vision_tower.vision_model.embeddings.patch_embedding.weight"], (4, 3, 2, 1)),
-                ps["vision_tower.vision_model.embeddings.patch_embedding.bias"],
-                c["vision_config"]["patch_size"]
+    m = VisionModel(
+        SiglipEncoder(
+            SiglipVisionEmbedding(
+                CrossCor(
+                    permutedims(ps["vision_tower.vision_model.embeddings.patch_embedding.weight"], (4, 3, 2, 1)),
+                    ps["vision_tower.vision_model.embeddings.patch_embedding.bias"],
+                    c["vision_config"]["patch_size"]
+                ),
+                ps["vision_tower.vision_model.embeddings.position_embedding.weight"]'
             ),
-            ps["vision_tower.vision_model.embeddings.position_embedding.weight"]'
-        ),
-        [
-            SiglipBlock(
-                SiglipAttention(
-                    Dense(
-                        ps["vision_tower.vision_model.encoder.layers.$i.self_attn.q_proj.weight"],
-                        ps["vision_tower.vision_model.encoder.layers.$i.self_attn.q_proj.bias"],
+            [
+                SiglipBlock(
+                    SiglipAttention(
+                        Dense(
+                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.q_proj.weight"],
+                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.q_proj.bias"],
+                        ),
+                        Dense(
+                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.k_proj.weight"],
+                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.k_proj.bias"],
+                        ),
+                        Dense(
+                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.v_proj.weight"],
+                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.v_proj.bias"],
+                        ),
+                        Dense(
+                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.out_proj.weight"],
+                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.out_proj.bias"],
+                        ),
+                        vc["num_attention_heads"]
                     ),
-                    Dense(
-                        ps["vision_tower.vision_model.encoder.layers.$i.self_attn.k_proj.weight"],
-                        ps["vision_tower.vision_model.encoder.layers.$i.self_attn.k_proj.bias"],
+                    LayerNorm(
+                        ps["vision_tower.vision_model.encoder.layers.$i.layer_norm1.weight"],
+                        ps["vision_tower.vision_model.encoder.layers.$i.layer_norm1.bias"],
+                        vc["layer_norm_eps"]
                     ),
-                    Dense(
-                        ps["vision_tower.vision_model.encoder.layers.$i.self_attn.v_proj.weight"],
-                        ps["vision_tower.vision_model.encoder.layers.$i.self_attn.v_proj.bias"],
+                    SiglipFFN(
+                        Dense(
+                            ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc1.weight"],
+                            ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc1.bias"],
+                        ),
+                        Dense(
+                            ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc2.weight"],
+                            ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc2.bias"],
+                        ),
                     ),
-                    Dense(
-                        ps["vision_tower.vision_model.encoder.layers.$i.self_attn.out_proj.weight"],
-                        ps["vision_tower.vision_model.encoder.layers.$i.self_attn.out_proj.bias"],
-                    ),
-                    vc["num_attention_heads"]
-                ),
-                LayerNorm(
-                    ps["vision_tower.vision_model.encoder.layers.$i.layer_norm1.weight"],
-                    ps["vision_tower.vision_model.encoder.layers.$i.layer_norm1.bias"],
-                    vc["layer_norm_eps"]
-                ),
-                SiglipFFN(
-                    Dense(
-                        ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc1.weight"],
-                        ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc1.bias"],
-                    ),
-                    Dense(
-                        ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc2.weight"],
-                        ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc2.bias"],
-                    ),
-                ),
-                LayerNorm(
-                    ps["vision_tower.vision_model.encoder.layers.$i.layer_norm2.weight"],
-                    ps["vision_tower.vision_model.encoder.layers.$i.layer_norm2.bias"],
-                    vc["layer_norm_eps"]
+                    LayerNorm(
+                        ps["vision_tower.vision_model.encoder.layers.$i.layer_norm2.weight"],
+                        ps["vision_tower.vision_model.encoder.layers.$i.layer_norm2.bias"],
+                        vc["layer_norm_eps"]
+                    )
                 )
+                for i in 0:vc["num_hidden_layers"]-1
+            ],
+            LayerNorm(
+                ps["vision_tower.vision_model.post_layernorm.weight"],
+                ps["vision_tower.vision_model.post_layernorm.bias"],
+                vc["layer_norm_eps"]
             )
-            for i in 0:vc["num_hidden_layers"]-1
-        ],
-        LayerNorm(
-            ps["vision_tower.vision_model.post_layernorm.weight"],
-            ps["vision_tower.vision_model.post_layernorm.bias"],
-            vc["layer_norm_eps"]
-        )
+        ),
+        let n_patches = vc["image_size"] ÷ vc["patch_size"], kernel_size = n_patches ÷ sqrt(c["mm_tokens_per_image"])
+            MultiModalProjector(
+                n_patches,
+                MeanPool((kernel_size, kernel_size)),
+                RMSNorm(vc["layer_norm_eps"], ps["multi_modal_projector.mm_soft_emb_norm.weight"]),
+                Dense(ps["multi_modal_projector.mm_input_projection_weight"]', nothing)
+            )
+        end
     )
-    p, m
+    ps, p, m
 end
