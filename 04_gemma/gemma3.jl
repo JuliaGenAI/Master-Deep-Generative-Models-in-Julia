@@ -5,12 +5,14 @@ using SafeTensors: load_sharded_safetensors
 import HuggingFaceTokenizers as HFT
 using NNlib: batched_mul, gelu_tanh, conv, DenseConvDims, softmax, meanpool, PoolDims
 using Statistics: mean, var
-using LinearAlgebra: triu
+using LinearAlgebra: triu, tril
+using ProgressMeter
 
 #####
 # Processor
 #####
 struct Processor
+    sliding_window::Int
     boi_token::String
     eoi_token::String
     image_token::String
@@ -26,18 +28,35 @@ end
 
 
 (p::Processor)(text::String, images::String) = p(text, [images])
+(p::Processor)(text::String) = p(text, [])
 function (p::Processor)(text::String, images::Vector{String})
-    # !!! Pan-and-Scan crops are ignored here for simplicity
-    imgs = cat([channelview(load(img)) for img in images]...; dims=4) # (C, H, W, B)
-    # The default BICUBIC interpolation in PIL is not found in Julia, so here we assume the image input is already resized for reproducibility
-    @assert size(imgs) == (3, p.height, p.width, length(images))
-    imgs = Float32.((imgs .- reshape(p.mean, 3, 1, 1, 1)) ./ reshape(p.std, 3, 1, 1, 1))
-
-    # Here we assume only one image is present in the text for simplicity
-    @assert length(findall(p.boi_token, text)) == 1
+    @assert length(findall(p.boi_token, text)) == length(images)
     expanded_text = replace(text, p.boi_token => "\n\n$(p.boi_token)$(repeat(p.image_token, p.mm_tokens_per_image))$(p.eoi_token)\n\n")
     tids = HFT.encode(p.tokenizer, expanded_text).ids .+ 1
-    tids, imgs
+
+    N = length(tids)
+    mask = triu(ones(Bool, N, N))
+
+    if length(images) == 0
+        return reshape(tids, :, 1), mask, mask .& tril(ones(Bool, N, N), p.sliding_window), nothing, nothing
+    else
+        # !!! Pan-and-Scan crops are ignored here for simplicity
+        imgs = cat([channelview(load(img)) for img in images]...; dims=4) # (C, H, W, B)
+        # The default BICUBIC interpolation in PIL is not found in Julia, so here we assume the image input is already resized for reproducibility
+        @assert size(imgs) == (3, p.height, p.width, length(images))
+        imgs = Float32.((imgs .- reshape(p.mean, 3, 1, 1, 1)) ./ reshape(p.std, 3, 1, 1, 1))
+
+        boi_token_id = HFT.encode(p.tokenizer, p.boi_token).ids[end] + 1
+        image_token_id = HFT.encode(p.tokenizer, p.image_token).ids[end] + 1
+        img_start_idx = [i for i in 1:N if tids[i] == boi_token_id]
+
+        for i in img_start_idx
+            mask[i+1:i+p.mm_tokens_per_image, i+1:i+p.mm_tokens_per_image] .= true
+        end
+
+        img_token_ids = findall(==(image_token_id), tids)
+        reshape(tids, :, 1), mask, mask .& tril(ones(Bool, N, N), p.sliding_window), imgs, img_token_ids
+    end
 end
 
 #####
@@ -182,7 +201,8 @@ struct MultiModalProjector
 end
 
 function (m::MultiModalProjector)(x)
-    P, D, B = size(x)
+    D, P, B = size(x)
+    x = permutedims(x, (2, 1, 3))
     x = reshape(x, m.patches_per_image, m.patches_per_image, D, B)
     x = m.pooling(x)
     x = reshape(x, :, D, B)
@@ -319,10 +339,15 @@ struct Transformer
     head::Dense
 end
 
-function (m::Transformer)(x, causal_mask, sliding_window_causal_mask)
+function (m::Transformer)(x, mask, sw_mask, imgs_emb=nothing, imgs_idx=nothing)
     h = m.embedding(x)
+
+    if !isnothing(imgs_emb)
+        h[:, imgs_idx] .= imgs_emb
+    end
+
     for (i, block) in enumerate(m.blocks)
-        h = block(h, i % m.sliding_window_pattern == 0 ? causal_mask : sliding_window_causal_mask)
+        h = block(h, i % m.sliding_window_pattern == 0 ? mask : sw_mask)
     end
     h = m.norm(h)
     m.head(h)
@@ -330,16 +355,58 @@ end
 
 #####
 
+struct Gemma3
+    language_model::Transformer
+    vision_model::VisionModel
+end
+
+#####
+
 using JSON3
+
+function generate(model, processor, text, images=String[]; max_new_tokens=1)
+    tokens, mask, sw_mask, imgs, imgs_id = processor(text, images)
+    if !isnothing(imgs)
+        @info "encoding imgs..."
+        imgs_emb = model.vision_model(imgs)
+        @info "finished encoding imgs"
+    else
+        imgs_emb = nothing
+    end
+
+    @showprogress for _ in 1:max_new_tokens
+        logits = m.language_model(tokens, mask, sw_mask, imgs_emb, imgs_id)
+        next_token = argmax(logits[:, end, 1])
+
+        tokens = vcat(tokens, [next_token])
+
+        _mask = zeros(Bool, size(mask, 1) + 1, size(mask, 2) + 1)
+        _mask[1:end-1, 1:end-1] .= mask
+        _mask[:, end] .= true
+        mask = _mask
+
+        _sw_mask = zeros(Bool, size(sw_mask, 1) + 1, size(sw_mask, 2) + 1)
+        _sw_mask[1:end-1, 1:end-1] .= sw_mask
+        _sw_mask[max(1, end - processor.sliding_window + 1):end, end] .= true
+        sw_mask = _sw_mask
+
+        println(HFT.decode(processor.tokenizer, vec(tokens) .- 1))
+    end
+
+    HFT.decode(processor.tokenizer, vec(tokens) .- 1)
+end
 
 function from_pretrained(MODEL=joinpath(@__DIR__, "..", "models", "google", "gemma-3-4b-it"))
     ps = load_sharded_safetensors(MODEL)
     c = JSON3.read(joinpath(MODEL, "config.json"))
+    tc = c["text_config"]
+    vc = c["vision_config"]
     pc = JSON3.read(joinpath(MODEL, "preprocessor_config.json"))
     stm = JSON3.read(joinpath(MODEL, "special_tokens_map.json"))
     tokenizer = HFT.from_file(HFT.Tokenizer, joinpath(MODEL, "tokenizer.json"))
 
     p = Processor(
+        tc["sliding_window"],
         stm["boi_token"],
         stm["eoi_token"],
         stm["image_token"],
@@ -351,79 +418,7 @@ function from_pretrained(MODEL=joinpath(@__DIR__, "..", "models", "google", "gem
         tokenizer
     )
 
-    vc = c["vision_config"]
 
-    m = VisionModel(
-        SiglipEncoder(
-            SiglipVisionEmbedding(
-                CrossCor(
-                    permutedims(ps["vision_tower.vision_model.embeddings.patch_embedding.weight"], (4, 3, 2, 1)),
-                    ps["vision_tower.vision_model.embeddings.patch_embedding.bias"],
-                    c["vision_config"]["patch_size"]
-                ),
-                ps["vision_tower.vision_model.embeddings.position_embedding.weight"]'
-            ),
-            [
-                SiglipBlock(
-                    SiglipAttention(
-                        Dense(
-                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.q_proj.weight"],
-                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.q_proj.bias"],
-                        ),
-                        Dense(
-                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.k_proj.weight"],
-                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.k_proj.bias"],
-                        ),
-                        Dense(
-                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.v_proj.weight"],
-                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.v_proj.bias"],
-                        ),
-                        Dense(
-                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.out_proj.weight"],
-                            ps["vision_tower.vision_model.encoder.layers.$i.self_attn.out_proj.bias"],
-                        ),
-                        vc["num_attention_heads"]
-                    ),
-                    LayerNorm(
-                        ps["vision_tower.vision_model.encoder.layers.$i.layer_norm1.weight"],
-                        ps["vision_tower.vision_model.encoder.layers.$i.layer_norm1.bias"],
-                        vc["layer_norm_eps"]
-                    ),
-                    SiglipFFN(
-                        Dense(
-                            ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc1.weight"],
-                            ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc1.bias"],
-                        ),
-                        Dense(
-                            ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc2.weight"],
-                            ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc2.bias"],
-                        ),
-                    ),
-                    LayerNorm(
-                        ps["vision_tower.vision_model.encoder.layers.$i.layer_norm2.weight"],
-                        ps["vision_tower.vision_model.encoder.layers.$i.layer_norm2.bias"],
-                        vc["layer_norm_eps"]
-                    )
-                )
-                for i in 0:vc["num_hidden_layers"]-1
-            ],
-            LayerNorm(
-                ps["vision_tower.vision_model.post_layernorm.weight"],
-                ps["vision_tower.vision_model.post_layernorm.bias"],
-                vc["layer_norm_eps"]
-            )
-        ),
-        let n_patches = vc["image_size"] ÷ vc["patch_size"], kernel_size = n_patches ÷ sqrt(c["mm_tokens_per_image"])
-            MultiModalProjector(
-                n_patches,
-                MeanPool((kernel_size, kernel_size)),
-                RMSNorm(vc["layer_norm_eps"], ps["multi_modal_projector.mm_soft_emb_norm.weight"]),
-                Dense(ps["multi_modal_projector.mm_input_projection_weight"]', nothing)
-            )
-        end
-    )
-
-    tc = c["text_config"]
     r_local = RopeCache(;
         rope_theta=tc["rope_local_base_freq"],
         head_dim=tc["head_dim"],
@@ -435,38 +430,114 @@ function from_pretrained(MODEL=joinpath(@__DIR__, "..", "models", "google", "gem
         max_position_embeddings=tc["max_position_embeddings"],
         factor=tc["rope_scaling"]["factor"]
     )
-    m = Transformer(
-        tc["sliding_window_pattern"],
-        EmbeddingLayer(ps["language_model.model.embed_tokens.weight"]'),
-        [
-            TransformerBlock(
-                RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.input_layernorm.weight"]),
-                Gemma3Attention(
-                    tc["head_dim"],
-                    tc["num_attention_heads"],
-                    tc["num_key_value_heads"],
-                    tc["query_pre_attn_scalar"],
-                    Dense(ps["language_model.model.layers.$i.self_attn.q_proj.weight"], nothing),
-                    Dense(ps["language_model.model.layers.$i.self_attn.k_proj.weight"], nothing),
-                    Dense(ps["language_model.model.layers.$i.self_attn.v_proj.weight"], nothing),
-                    Dense(ps["language_model.model.layers.$i.self_attn.o_proj.weight"], nothing),
-                    RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.self_attn.q_norm.weight"]),
-                    RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.self_attn.k_norm.weight"]),
-                    (i + 1) % tc["sliding_window_pattern"] == 0 ? r_global : r_local,
+    m = Gemma3(
+        Transformer(
+            tc["sliding_window_pattern"],
+            EmbeddingLayer(ps["language_model.model.embed_tokens.weight"]'),
+            [
+                TransformerBlock(
+                    RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.input_layernorm.weight"]),
+                    Gemma3Attention(
+                        tc["head_dim"],
+                        tc["num_attention_heads"],
+                        tc["num_key_value_heads"],
+                        tc["query_pre_attn_scalar"],
+                        Dense(ps["language_model.model.layers.$i.self_attn.q_proj.weight"], nothing),
+                        Dense(ps["language_model.model.layers.$i.self_attn.k_proj.weight"], nothing),
+                        Dense(ps["language_model.model.layers.$i.self_attn.v_proj.weight"], nothing),
+                        Dense(ps["language_model.model.layers.$i.self_attn.o_proj.weight"], nothing),
+                        RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.self_attn.q_norm.weight"]),
+                        RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.self_attn.k_norm.weight"]),
+                        (i + 1) % tc["sliding_window_pattern"] == 0 ? r_global : r_local,
+                    ),
+                    RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.post_attention_layernorm.weight"]),
+                    RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.pre_feedforward_layernorm.weight"]),
+                    FeedForwardLayer(
+                        Dense(ps["language_model.model.layers.$i.mlp.up_proj.weight"], nothing),
+                        Dense(ps["language_model.model.layers.$i.mlp.gate_proj.weight"], nothing),
+                        Dense(ps["language_model.model.layers.$i.mlp.down_proj.weight"], nothing)
+                    ),
+                    RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.post_feedforward_layernorm.weight"])
+                )
+                for i in 0:tc["num_hidden_layers"]-1
+            ],
+            RMSNorm(tc["rms_norm_eps"], ps["language_model.model.norm.weight"]),
+            Dense(ps["language_model.model.embed_tokens.weight"], nothing)
+        ),
+        VisionModel(
+            SiglipEncoder(
+                SiglipVisionEmbedding(
+                    CrossCor(
+                        permutedims(ps["vision_tower.vision_model.embeddings.patch_embedding.weight"], (4, 3, 2, 1)),
+                        ps["vision_tower.vision_model.embeddings.patch_embedding.bias"],
+                        c["vision_config"]["patch_size"]
+                    ),
+                    ps["vision_tower.vision_model.embeddings.position_embedding.weight"]'
                 ),
-                RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.post_attention_layernorm.weight"]),
-                RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.pre_feedforward_layernorm.weight"]),
-                FeedForwardLayer(
-                    Dense(ps["language_model.model.layers.$i.mlp.up_proj.weight"], nothing),
-                    Dense(ps["language_model.model.layers.$i.mlp.gate_proj.weight"], nothing),
-                    Dense(ps["language_model.model.layers.$i.mlp.down_proj.weight"], nothing)
-                ),
-                RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.post_feedforward_layernorm.weight"])
-            )
-            for i in 0:tc["num_hidden_layers"]-1
-        ],
-        RMSNorm(tc["rms_norm_eps"], ps["language_model.model.norm.weight"]),
-        Dense(ps["language_model.model.embed_tokens.weight"], nothing)
+                [
+                    SiglipBlock(
+                        SiglipAttention(
+                            Dense(
+                                ps["vision_tower.vision_model.encoder.layers.$i.self_attn.q_proj.weight"],
+                                ps["vision_tower.vision_model.encoder.layers.$i.self_attn.q_proj.bias"],
+                            ),
+                            Dense(
+                                ps["vision_tower.vision_model.encoder.layers.$i.self_attn.k_proj.weight"],
+                                ps["vision_tower.vision_model.encoder.layers.$i.self_attn.k_proj.bias"],
+                            ),
+                            Dense(
+                                ps["vision_tower.vision_model.encoder.layers.$i.self_attn.v_proj.weight"],
+                                ps["vision_tower.vision_model.encoder.layers.$i.self_attn.v_proj.bias"],
+                            ),
+                            Dense(
+                                ps["vision_tower.vision_model.encoder.layers.$i.self_attn.out_proj.weight"],
+                                ps["vision_tower.vision_model.encoder.layers.$i.self_attn.out_proj.bias"],
+                            ),
+                            vc["num_attention_heads"]
+                        ),
+                        LayerNorm(
+                            ps["vision_tower.vision_model.encoder.layers.$i.layer_norm1.weight"],
+                            ps["vision_tower.vision_model.encoder.layers.$i.layer_norm1.bias"],
+                            vc["layer_norm_eps"]
+                        ),
+                        SiglipFFN(
+                            Dense(
+                                ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc1.weight"],
+                                ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc1.bias"],
+                            ),
+                            Dense(
+                                ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc2.weight"],
+                                ps["vision_tower.vision_model.encoder.layers.$i.mlp.fc2.bias"],
+                            ),
+                        ),
+                        LayerNorm(
+                            ps["vision_tower.vision_model.encoder.layers.$i.layer_norm2.weight"],
+                            ps["vision_tower.vision_model.encoder.layers.$i.layer_norm2.bias"],
+                            vc["layer_norm_eps"]
+                        )
+                    )
+                    for i in 0:vc["num_hidden_layers"]-1
+                ],
+                LayerNorm(
+                    ps["vision_tower.vision_model.post_layernorm.weight"],
+                    ps["vision_tower.vision_model.post_layernorm.bias"],
+                    vc["layer_norm_eps"]
+                )
+            ),
+            let n_patches = vc["image_size"] ÷ vc["patch_size"], kernel_size = n_patches ÷ sqrt(c["mm_tokens_per_image"])
+                MultiModalProjector(
+                    n_patches,
+                    MeanPool((Int(kernel_size), Int(kernel_size))),
+                    RMSNorm(vc["layer_norm_eps"], ps["multi_modal_projector.mm_soft_emb_norm.weight"]),
+                    Dense(ps["multi_modal_projector.mm_input_projection_weight"]', nothing)
+                )
+            end
+        )
     )
-    ps, p, m
+    m, p
+end
+
+function main()
+    m, p = from_pretrained()
+    generate(m, p, "This is the logo of the JuliaGenAI org: <start_of_image>. In this image", "JuliaGenAI_logo_RGB_896x896.png"; max_new_tokens=100)
 end
