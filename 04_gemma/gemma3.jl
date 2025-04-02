@@ -5,6 +5,7 @@ using SafeTensors: load_sharded_safetensors
 import HuggingFaceTokenizers as HFT
 using NNlib: batched_mul, gelu_tanh, conv, DenseConvDims, softmax, meanpool, PoolDims
 using Statistics: mean, var
+using LinearAlgebra: triu
 
 #####
 # Processor
@@ -229,8 +230,8 @@ function apply_rotary_embedding(x, cache)
     freqs_cos = reshape(cache.cos[:, 1:T], :, 1, T)
     freqs_sin = reshape(cache.sin[:, 1:T], :, 1, T)
 
-    x_r = selectdim(reshape(x, 2, :, size(x)[2:end]...), 1, 1)
-    x_i = selectdim(reshape(x, 2, :, size(x)[2:end]...), 1, 2)
+    x_r = selectdim(reshape(x, :, 2, size(x)[2:end]...), 2, 1)
+    x_i = selectdim(reshape(x, :, 2, size(x)[2:end]...), 2, 2)
 
     x_pos_r = freqs_cos .* x_r .- freqs_sin .* x_i
     x_pos_i = freqs_sin .* x_r .+ freqs_cos .* x_i
@@ -289,8 +290,8 @@ end
 
 function (m::FeedForwardLayer)(x)
     h = m.up_proj(x)
-    a = m.gate_proj(x)
-    h = gelu_tanh.(a .* h)
+    a = gelu_tanh.(m.gate_proj(x))
+    h = a .* h
     o = m.down_proj(h)
 end
 
@@ -310,19 +311,21 @@ function (m::TransformerBlock)(x, mask)
 end
 
 struct Transformer
+    sliding_window_pattern::Int
+
     embedding::EmbeddingLayer
     blocks::Vector{TransformerBlock}
     norm::RMSNorm
     head::Dense
 end
 
-function (m::Transformer)(x, causal_mask, sliding_window_causal_mask, sliding_window_pattern)
+function (m::Transformer)(x, causal_mask, sliding_window_causal_mask)
     h = m.embedding(x)
     for (i, block) in enumerate(m.blocks)
-        h = block(h, sliding_window_pattern % i == 0 ? mask : sliding_window_causal_mask)
+        h = block(h, i % m.sliding_window_pattern == 0 ? causal_mask : sliding_window_causal_mask)
     end
     h = m.norm(h)
-    m.dense(h)
+    m.head(h)
 end
 
 #####
@@ -418,6 +421,52 @@ function from_pretrained(MODEL=joinpath(@__DIR__, "..", "models", "google", "gem
                 Dense(ps["multi_modal_projector.mm_input_projection_weight"]', nothing)
             )
         end
+    )
+
+    tc = c["text_config"]
+    r_local = RopeCache(;
+        rope_theta=tc["rope_local_base_freq"],
+        head_dim=tc["head_dim"],
+        max_position_embeddings=tc["max_position_embeddings"],
+    )
+    r_global = RopeCache(;
+        rope_theta=tc["rope_theta"],
+        head_dim=tc["head_dim"],
+        max_position_embeddings=tc["max_position_embeddings"],
+        factor=tc["rope_scaling"]["factor"]
+    )
+    m = Transformer(
+        tc["sliding_window_pattern"],
+        EmbeddingLayer(ps["language_model.model.embed_tokens.weight"]'),
+        [
+            TransformerBlock(
+                RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.input_layernorm.weight"]),
+                Gemma3Attention(
+                    tc["head_dim"],
+                    tc["num_attention_heads"],
+                    tc["num_key_value_heads"],
+                    tc["query_pre_attn_scalar"],
+                    Dense(ps["language_model.model.layers.$i.self_attn.q_proj.weight"], nothing),
+                    Dense(ps["language_model.model.layers.$i.self_attn.k_proj.weight"], nothing),
+                    Dense(ps["language_model.model.layers.$i.self_attn.v_proj.weight"], nothing),
+                    Dense(ps["language_model.model.layers.$i.self_attn.o_proj.weight"], nothing),
+                    RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.self_attn.q_norm.weight"]),
+                    RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.self_attn.k_norm.weight"]),
+                    (i + 1) % tc["sliding_window_pattern"] == 0 ? r_global : r_local,
+                ),
+                RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.post_attention_layernorm.weight"]),
+                RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.pre_feedforward_layernorm.weight"]),
+                FeedForwardLayer(
+                    Dense(ps["language_model.model.layers.$i.mlp.up_proj.weight"], nothing),
+                    Dense(ps["language_model.model.layers.$i.mlp.gate_proj.weight"], nothing),
+                    Dense(ps["language_model.model.layers.$i.mlp.down_proj.weight"], nothing)
+                ),
+                RMSNorm(tc["rms_norm_eps"], ps["language_model.model.layers.$i.post_feedforward_layernorm.weight"])
+            )
+            for i in 0:tc["num_hidden_layers"]-1
+        ],
+        RMSNorm(tc["rms_norm_eps"], ps["language_model.model.norm.weight"]),
+        Dense(ps["language_model.model.embed_tokens.weight"], nothing)
     )
     ps, p, m
 end
