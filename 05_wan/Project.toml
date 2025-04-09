@@ -1,3 +1,8 @@
 [deps]
+FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
+ImageCore = "a09fc81d-aa75-5fe9-8630-4744c3626534"
+JpegTurbo = "b835a17e-a41a-41e7-81f0-2f016b05efe0"
+NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
 Pickle = "fbb45041-c46e-462f-888f-7c521cafbc2c"
 SafeTensors = "eeda0dda-7046-4914-a807-2495fc7abb89"
+VideoIO = "d6d074c3-1acf-5d4c-9a43-ef38773959a2"
