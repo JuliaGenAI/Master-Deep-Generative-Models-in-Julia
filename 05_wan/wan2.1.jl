@@ -43,14 +43,26 @@ function (m::Conv2d)(x)
     y .+ reshape(m.bias, 1, 1, :, 1)
 end
 
-struct DownSample2d
+@kwdef struct ReSample
     resample::Conv2d
+    time_conv = nothing
 end
 
-function (m::DownSample2d)(x)
-    y = permutedims(x, (1, 2, 4, 3, 5)) # (W, H, T, C, B) -> (W, H, C, T, B)
+function (m::ReSample)(x)
+    W, H, T, C, B = size(x)
+    # padding
+    y = similar(x, W + 1, H + 1, T, C, B)
+    fill(y, 0)
+    y[axes(x)...] .= x
+
+    y = permutedims(y, (1, 2, 4, 3, 5)) # (W, H, T, C, B) -> (W, H, C, T, B)
     y = reshape(y, size(y)[1:3]..., :)
-    m.resample(y)
+    y = m.resample(y)
+    y = reshape(y, size(y)[1:3]..., T, B)
+    permutedims(y, (1, 2, 4, 3, 5)) # (W, H, C, T, B) -> (W, H, T, C, B)
+end
+
+struct DownSample3d
 end
 
 @kwdef struct CausalConv3d
@@ -140,4 +152,12 @@ function main()
     #     down_norm=RMSNorm(weight=permutedims(ps_vae["encoder.downsamples.0.residual.3.gamma"], (4, 3, 2, 1)), channel_dim=4),
     #     down_proj=CausalConv3d(weight=permutedims(ps_vae["encoder.downsamples.0.residual.6.weight"], (5, 4, 3, 2, 1)), bias=ps_vae["encoder.downsamples.0.residual.6.bias"], stride=1, padding=1),
     # )
+    m = ReSample(
+        Conv2d(
+            weight=permutedims(ps_vae["encoder.downsamples.2.resample.1.weight"], (4, 3, 2, 1)),
+            bias=ps_vae["encoder.downsamples.2.resample.1.bias"],
+            stride=2,
+            padding=0,
+        )
+    )
 end
