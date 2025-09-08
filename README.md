@@ -19,7 +19,7 @@ Step 2. Download models
 model=openai-community/gpt2 make download  # GPT2 model
 HF_TOKEN=... model=meta-llama/Llama-3.2-1B-Instruct make download  # Llama model (requires HuggingFace token and accepting the license agreement: https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct)
 model=deepseek-ai/DeepSeek-V2-Lite-Chat make download  # DeepSeek model
-model=google/gemma-3-4b-it make download  # Gemma model
+HF_TOKEN=... model=google/gemma-3-4b-it make download  # Gemma model (requires HuggingFace token and accepting the license agreement: https://huggingface.co/google/gemma-3-4b-it)
 ```
 
 Step 3. Run examples
