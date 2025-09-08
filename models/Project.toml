@@ -1,0 +1,4 @@
+[deps]
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+RAGTools = "16ddad29-bbe8-45a7-857d-3d9514eb0023"
+Transformers = "21ca0261-441d-5938-ace7-c90938fde4d4"
